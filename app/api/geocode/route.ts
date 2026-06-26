@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server'
-import { getCached, putCached } from '@/lib/cache'
-import { normalize, searchNominatim, UpstreamError } from '@/lib/geocode'
-import type { GeocodeResponse } from '@/lib/types'
+import { resolveLocation } from '@/lib/resolve'
+import { UpstreamError } from '@/lib/geocode'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -15,44 +14,16 @@ export async function GET(request: Request) {
     return NextResponse.json({ detail: 'invalid_query' }, { status: 400 })
   }
 
-  const key = normalize(q)
-
   try {
-    const hit = await getCached(key)
-    if (hit) return NextResponse.json(hit)
-
-    let result
-    try {
-      result = await searchNominatim(key)
-    } catch (e) {
-      if (e instanceof UpstreamError) {
-        return NextResponse.json({ detail: 'upstream_error' }, { status: 502 })
-      }
-      throw e
-    }
-
+    const result = await resolveLocation(q)
     if (!result) {
       return NextResponse.json({ detail: 'no_result' }, { status: 404 })
     }
-
-    await putCached({
-      query: key,
-      latitude: result.latitude,
-      longitude: result.longitude,
-      display_name: result.display_name,
-      provider: 'nominatim',
-    })
-
-    const body: GeocodeResponse = {
-      query: key,
-      latitude: result.latitude,
-      longitude: result.longitude,
-      display_name: result.display_name,
-      provider: 'nominatim',
-      cached: false,
-    }
-    return NextResponse.json(body)
+    return NextResponse.json(result)
   } catch (e) {
+    if (e instanceof UpstreamError) {
+      return NextResponse.json({ detail: 'upstream_error' }, { status: 502 })
+    }
     return NextResponse.json(
       { detail: 'internal_error', message: (e as Error).message },
       { status: 500 },
