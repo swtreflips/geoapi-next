@@ -19,6 +19,17 @@ export function getConfig() {
     nominatimTimeoutMs: Number(process.env.NOMINATIM_TIMEOUT ?? '10') * 1000,
     nominatimCountryCodes: process.env.NOMINATIM_COUNTRY_CODES ?? 'us', // US cities only
 
+    // HERE Routing v8 — truck (drayage) routes. Key is server-only, never NEXT_PUBLIC_*.
+    hereApiUrl: process.env.HERE_API_URL ?? 'https://router.hereapi.com/v8/routes',
+    hereApiKey: must('HERE_API_KEY'),
+    hereMinIntervalMs: Number(process.env.HERE_MIN_INTERVAL ?? '0.5') * 1000,
+    hereTimeoutMs: Number(process.env.HERE_TIMEOUT ?? '15') * 1000,
+    // Truck profile (HERE v8 units: dimensions in CENTIMETERS, weight in KILOGRAMS).
+    truckHeightCm: Number(process.env.TRUCK_HEIGHT_CM ?? '400'),
+    truckWidthCm: Number(process.env.TRUCK_WIDTH_CM ?? '300'),
+    truckLengthCm: Number(process.env.TRUCK_LENGTH_CM ?? '1600'),
+    truckWeightKg: Number(process.env.TRUCK_WEIGHT_KG ?? '36000'),
+
     appName: process.env.APP_NAME ?? 'schedules-geocoder',
     appVersion: process.env.APP_VERSION ?? '0.1',
   }

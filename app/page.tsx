@@ -1,7 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import type { GeocodeResponse } from '@/lib/types'
+import type { GeocodeResponse, RouteResponse } from '@/lib/types'
 
 export default function Home() {
   const [q, setQ] = useState('')
@@ -22,6 +22,13 @@ export default function Home() {
     a_result: GeocodeResponse
     b_result: GeocodeResponse
   }>(null)
+
+  // ── drayage route (HERE truck route between two cities) ───────────────
+  const [oLoc, setOLoc] = useState('')
+  const [dLoc, setDLoc] = useState('')
+  const [routeLoading, setRouteLoading] = useState(false)
+  const [routeError, setRouteError] = useState<string | null>(null)
+  const [route, setRoute] = useState<RouteResponse | null>(null)
 
   async function run() {
     if (!q.trim()) return
@@ -62,6 +69,28 @@ export default function Home() {
       setNearError((err as Error).message)
     } finally {
       setNearLoading(false)
+    }
+  }
+
+  async function runRoute() {
+    if (!oLoc.trim() || !dLoc.trim()) return
+    setRouteLoading(true)
+    setRouteError(null)
+    setRoute(null)
+    try {
+      const res = await fetch(
+        `/api/route?a=${encodeURIComponent(oLoc)}&b=${encodeURIComponent(dLoc)}`,
+      )
+      const body = await res.json()
+      if (!res.ok) {
+        setRouteError(`${res.status} — ${body.detail ?? 'error'}${body.message ? `: ${body.message}` : ''}`)
+      } else {
+        setRoute(body as RouteResponse)
+      }
+    } catch (err) {
+      setRouteError((err as Error).message)
+    } finally {
+      setRouteLoading(false)
     }
   }
 
@@ -221,6 +250,108 @@ export default function Home() {
           </div>
         </div>
       )}
+
+      {/* ── Drayage route: HERE truck route between two cities ─────────────── */}
+      <hr style={{ border: 'none', borderTop: '1px solid #eee', margin: '32px 0 24px' }} />
+      <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Drayage route</h2>
+      <p style={{ color: '#666', fontSize: 13, marginBottom: 16 }}>
+        Geocodes both cities, then fetches a realistic truck route from HERE. Distance and
+        typical (traffic-aware) drive time, cached per origin → destination pair.
+      </p>
+
+      <form
+        onSubmit={(e) => {
+          e.preventDefault()
+          void runRoute()
+        }}
+        style={{ display: 'grid', gap: 8, marginBottom: 16 }}
+      >
+        <input
+          value={oLoc}
+          onChange={(e) => setOLoc(e.target.value)}
+          placeholder="Origin — e.g. Los Angeles, CA"
+          style={{ padding: '10px 12px', border: '1px solid #ccc', borderRadius: 8, fontSize: 14 }}
+        />
+        <input
+          value={dLoc}
+          onChange={(e) => setDLoc(e.target.value)}
+          placeholder="Destination — e.g. Phoenix, AZ"
+          style={{ padding: '10px 12px', border: '1px solid #ccc', borderRadius: 8, fontSize: 14 }}
+        />
+        <button
+          type="submit"
+          disabled={routeLoading}
+          style={{
+            padding: '10px 16px',
+            border: 'none',
+            borderRadius: 8,
+            background: '#111',
+            color: '#fff',
+            fontWeight: 600,
+            fontSize: 14,
+            cursor: routeLoading ? 'default' : 'pointer',
+            opacity: routeLoading ? 0.6 : 1,
+            justifySelf: 'start',
+          }}
+        >
+          {routeLoading ? 'Routing…' : 'Get route'}
+        </button>
+      </form>
+
+      {routeError && (
+        <div style={{ padding: 12, background: '#fde8e8', color: '#9b1c1c', borderRadius: 8, fontSize: 14 }}>
+          {routeError}
+        </div>
+      )}
+
+      {route && (
+        <div style={{ border: '1px solid #eee', borderRadius: 12, padding: 16, fontSize: 14 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12 }}>
+            <strong>
+              {route.origin} → {route.destination}
+            </strong>
+            <span
+              style={{
+                fontSize: 11,
+                padding: '2px 8px',
+                borderRadius: 999,
+                background: route.cached ? '#def7ec' : '#e1effe',
+                color: route.cached ? '#03543f' : '#1e429f',
+                fontWeight: 600,
+              }}
+            >
+              {route.cached ? 'CACHED' : 'FRESH'}
+            </span>
+          </div>
+          <div style={{ display: 'flex', gap: 24, marginBottom: 8 }}>
+            <div>
+              <div style={{ color: '#999', fontSize: 11 }}>DISTANCE</div>
+              <div style={{ fontWeight: 600 }}>
+                {(route.distance_m / 1000).toFixed(1)} km
+                <span style={{ color: '#999', fontWeight: 400 }}>
+                  {' '}
+                  ({(route.distance_m / 1609.344).toFixed(0)} mi)
+                </span>
+              </div>
+            </div>
+            <div>
+              <div style={{ color: '#999', fontSize: 11 }}>TYPICAL DRIVE TIME</div>
+              <div style={{ fontWeight: 600 }}>{fmtDuration(route.typical_duration_s ?? route.duration_s)}</div>
+            </div>
+          </div>
+          <div style={{ fontFamily: 'ui-monospace, monospace', color: '#999', fontSize: 11, wordBreak: 'break-all' }}>
+            polyline: {route.polyline.slice(0, 48)}…
+          </div>
+        </div>
+      )}
     </main>
   )
+}
+
+// Format seconds as "Xh Ym" (or "Ym" under an hour).
+function fmtDuration(seconds: number): string {
+  const m = Math.round(seconds / 60)
+  const h = Math.floor(m / 60)
+  const rem = m % 60
+  return h > 0 ? `${h}h ${rem}m` : `${rem}m`
 }

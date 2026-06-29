@@ -160,6 +160,74 @@ $$;
 
 ---
 
+## 5b. `drayage_routes` — HERE truck-route cache
+
+Written by the app (`/api/route`) on every new origin→destination pair; the two `geom`
+columns are set by a trigger. Same philosophy as `geocode_cache`: cache so each pair only
+ever hits HERE once. The cache key is the **(origin, destination) pair of normalized city
+keys** (same `normalize` as `geocode_cache.query`) — directional, so A→B and B→A are
+separate rows. Durations are **traffic-typical** (the app sends no `departureTime`), so cached
+values stay meaningful indefinitely.
+
+> HERE units gotcha (mirrors the lon-first / geography lessons above): HERE v8 truck
+> dimensions are in **centimeters**, weight in **kilograms** — `summary.length` is **meters**,
+> `summary.duration` is **seconds**. The `polyline` is HERE *flexible polyline* (not WKB) — it
+> stays `text` and is decoded client-side; do **not** try to cast it to geometry.
+
+**Fresh setup:**
+```sql
+create table if not exists public.drayage_routes (
+  origin_query        text not null,              -- normalized origin city key
+  destination_query   text not null,              -- normalized destination city key
+  origin_lat          double precision not null,
+  origin_lon          double precision not null,
+  dest_lat            double precision not null,
+  dest_lon            double precision not null,
+  distance_m          double precision not null,  -- summary.length (meters)
+  duration_s          integer not null,           -- summary.duration (seconds)
+  base_duration_s     integer,                    -- summary.baseDuration (free-flow)
+  typical_duration_s  integer,                    -- summary.typicalDuration (primary ETA)
+  polyline            text not null,              -- HERE flexible polyline (decode client-side)
+  transport_mode      text not null default 'truck',
+  provider            text not null default 'here',
+  origin_geom         geography(Point, 4326),     -- set by trigger
+  dest_geom           geography(Point, 4326),     -- set by trigger
+  created_at          timestamptz default now(),
+  primary key (origin_query, destination_query)   -- the cache key + lookup index
+);
+```
+
+**Trigger — two points (same pattern as §4 `set_geom`, adapted for origin+dest):**
+```sql
+create or replace function set_route_geom()
+returns trigger language plpgsql as $$
+begin
+  NEW.origin_geom := ST_SetSRID(ST_MakePoint(NEW.origin_lon, NEW.origin_lat), 4326)::geography;
+  NEW.dest_geom   := ST_SetSRID(ST_MakePoint(NEW.dest_lon,   NEW.dest_lat),   4326)::geography;
+  return NEW;
+end;
+$$;
+
+drop trigger if exists trg_set_route_geom on public.drayage_routes;
+create trigger trg_set_route_geom before insert or update on public.drayage_routes
+  for each row execute function set_route_geom();
+```
+
+**Spatial indexes (for future "routes near point X" queries):**
+```sql
+create index if not exists drayage_routes_origin_geom_idx on public.drayage_routes using gist (origin_geom);
+create index if not exists drayage_routes_dest_geom_idx   on public.drayage_routes using gist (dest_geom);
+analyze public.drayage_routes;
+```
+
+**RLS (same posture as `geocode_cache` — the server's service-role key bypasses it):**
+```sql
+alter table public.drayage_routes enable row level security;
+-- no policies needed; service-role key is used server-side only.
+```
+
+---
+
 ## 6. RLS & keys
 
 - `geocode_cache` has **RLS enabled**. The app uses the Supabase **service-role key**
@@ -169,6 +237,9 @@ $$;
   from the browser later) can run them without table policies — they only ever return a
   boolean/coords, never raw rows.
 - Never expose the service-role key to the browser.
+- The **HERE** API key (`HERE_API_KEY`) is likewise server-only (used only in `lib/here.ts` via
+  `getConfig()`) — never `NEXT_PUBLIC_*`, never sent to the browser. Restrict it in the HERE
+  platform (Routing API + allowed domains) and rotate it if it has ever been committed/shared.
 
 ---
 
@@ -192,4 +263,59 @@ select count(*) total, count(geom) with_geom from us_ports;
 explain analyze
 select exists (select 1 from us_ports p
   where st_dwithin(p.geom, st_setsrid(st_makepoint(-118.2437,34.0522),4326)::geography, 80467));
+
+-- drayage_routes: geom columns are geography + populated after a route is cached
+select column_name, udt_name from information_schema.columns
+where table_name = 'drayage_routes' and column_name in ('origin_geom','dest_geom');
+select count(*) total, count(origin_geom) with_geom from drayage_routes;
 ```
+
+---
+
+## 8. Architecture — two parallel pipelines, one shared resolver
+
+Two structurally identical provider pipelines (Nominatim geocoder, HERE truck router) sit
+side by side. The **only** coupling is that the HERE orchestrator reuses the Nominatim
+orchestrator (`resolveLocation`) to turn city names into the coordinates HERE needs — a
+one-directional dependency: **HERE → Nominatim, never the reverse.**
+
+```
+   CLIENT (app/page.tsx)              Next.js Route Handlers
+   ─────────────────────             ──────────────────────
+   "Los Angeles, CA"  ───────────▶  GET /api/geocode ?q=
+   "LA" + "Santa Monica" ────────▶  GET /api/within  ?a=&b=&miles=
+   "LA" + "Phoenix"   ───────────▶  GET /api/route   ?a=&b=
+
+  NOMINATIM PIPELINE                                   HERE PIPELINE
+  ──────────────────                                   ─────────────
+  lib/resolve.ts                                       lib/route.ts
+  resolveLocation(q)  ◀── REUSED BY /within AND /route ── resolveRoute(a,b)
+        │                                                      │
+        │ 1. normalize(q)                                      │ 1. check route cache FIRST
+        ▼                                                      ▼
+  lib/cache.ts                                           lib/routeCache.ts
+  getCached → geocode_cache                              getCachedRoute → drayage_routes
+        │  hit? return coords                                  │  hit? return route ✅ 0 API calls
+        │  miss ↓                                              │  miss ↓
+        ▼                                                      │ 2. needs coords →
+  lib/geocode.ts                                              │    calls resolveLocation ───┐
+  searchNominatim(q) ── HTTP ─▶ Nominatim API                │    (the box on the left)    │
+        │ upsert                                              ▼ 3. fetchRoute(coordsA,B)     │
+        ▼                                              lib/here.ts ── HTTP ─▶ HERE Routing v8│
+  geocode_cache (Supabase/PostGIS)                           ▼ 4. upsert                    │
+        ▲                                              drayage_routes (Supabase/PostGIS)    │
+        └───────────── HERE "feeds from" Nominatim here ──────────────────────────────────┘
+```
+
+**Two layers of cache savings stack:**
+1. Repeat **pair** (LA→Phoenix again) → served from `drayage_routes`, **zero** external calls.
+2. New pair of **known cities** (Long Beach→Phoenix) → HERE is called once, but Nominatim is
+   **not**, because both cities are already in `geocode_cache`.
+
+| | Nominatim system | HERE system |
+|---|---|---|
+| Provider | `lib/geocode.ts` | `lib/here.ts` |
+| Cache table | `geocode_cache` (`lib/cache.ts`) | `drayage_routes` (`lib/routeCache.ts`) |
+| Orchestrator | `lib/resolve.ts` | `lib/route.ts` |
+| Endpoint | `/api/geocode` (+ `/api/within`) | `/api/route` |
+| Input → output | 1 city → coords | 2 cities → truck route |
